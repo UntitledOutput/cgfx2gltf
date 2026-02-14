@@ -4,6 +4,7 @@
 #include "cgfx/pica/shader.h"
 #include "common.h"
 #include "kgflags.h"
+#include "lz11.h"
 #include "stb_image.h"
 #include "stb_image_write.h"
 #include "utilities.h"
@@ -30,50 +31,97 @@ typedef struct {
   uint32_t num_bone_grps;
 } face_group;
 
-int main(int argc, char **argv) {
-  const char *cgfx_path;
-  kgflags_string("i", NULL, "The input file that should be processed", true,
-                 &cgfx_path);
+typedef struct {
+  char **paths;
+  int capacity;
+  int count;
+} file_list_t;
 
-  char *output_dir;
-  kgflags_string("o", NULL,
-                 "Directory path which exported files should be stored in",
-                 false, (const char **)&output_dir);
-
-  bool verbose;
-  kgflags_bool("v", false, "Write more detailed output to console", false,
-               &verbose);
-
-  bool list_contents;
-  kgflags_bool("l", false, "Only list file contents then stop", false,
-               &list_contents);
-
-#ifdef WIN32
-  kgflags_set_prefix("/");
-#else
-  kgflags_set_prefix("-");
-#endif
-
-  kgflags_set_custom_description("* * * * cgfx2gltf by kathrindc * * * *");
-
-  if (!kgflags_parse(argc, argv)) {
-    kgflags_print_errors();
-    printf("\n");
-    kgflags_print_usage();
-    exit(1);
+static int collect_file_callback(const char *filepath, void *userdata) {
+  file_list_t *list = (file_list_t *)userdata;
+  if (list->count >= list->capacity) {
+    // Grow the array
+    int new_capacity = list->capacity * 2;
+    char **new_paths = realloc(list->paths, new_capacity * sizeof(char *));
+    if (!new_paths) {
+      return -1; // Signal error
+    }
+    list->paths = new_paths;
+    list->capacity = new_capacity;
   }
+  list->paths[list->count++] = strdup(filepath);
+  return 0; // Continue scanning
+}
 
-  stbi_write_tga_with_rle = 0;
-
+int process_single_cgfx_file(const char *cgfx_path, const char *output_dir_override, bool verbose, bool list_contents) {
   FILE *cgfx_file = fopen(cgfx_path, "rb");
   if (!cgfx_file) {
     fprintf(stderr, "unable to open cgfx file (%d)\n", errno);
     fprintf(stderr, "%s\n", strerror(errno));
-    exit(1);
+    return 1;
   }
 
+  // Check for LZ11 compression and decompress if needed
+  uint8_t *file_buffer = NULL;
+  size_t buffer_size = 0;
+  int is_lz11_compressed = 0;
+  
+  {
+    // Read first 4 bytes to check for LZ11 magic
+    uint8_t header[4];
+    if (fread(header, 1, 4, cgfx_file) == 4 && header[0] == 0x11) {
+      // File is LZ11 compressed
+      is_lz11_compressed = 1;
+      fseek(cgfx_file, 0, SEEK_SET);
+      
+      // Read entire file
+      fseek(cgfx_file, 0, SEEK_END);
+      long file_size = ftell(cgfx_file);
+      fseek(cgfx_file, 0, SEEK_SET);
+      
+      uint8_t *compressed_data = malloc(file_size);
+      if (!compressed_data || fread(compressed_data, 1, file_size, cgfx_file) != (size_t)file_size) {
+        fprintf(stderr, "Failed to read compressed file\n");
+        free(compressed_data);
+        fclose(cgfx_file);
+        return 1;
+      }
+      
+      fclose(cgfx_file);
+      
+      if (verbose) {
+        printf("Detected LZ11 compression, decompressing...\n");
+      }
+      
+      // Decompress
+      file_buffer = lz11_decompress(compressed_data, file_size, &buffer_size);
+      free(compressed_data);
+      
+      if (!file_buffer) {
+        fprintf(stderr, "Failed to decompress LZ11 data\n");
+        return 1;
+      }
+      
+      if (verbose) {
+        printf("Decompressed %zu bytes -> %zu bytes\n", (size_t)file_size, buffer_size);
+      }
+      
+      // Create a memory-based FILE* for reading decompressed data
+      cgfx_file = fmemopen(file_buffer, buffer_size, "rb");
+      if (!cgfx_file) {
+        fprintf(stderr, "Failed to create memory stream\n");
+        free(file_buffer);
+        return 1;
+      }
+    } else {
+      // Not compressed, reset to beginning
+      fseek(cgfx_file, 0, SEEK_SET);
+    }
+  }
+
+  char *output_dir = NULL;
   if (!list_contents) {
-    if (output_dir == NULL) {
+    if (output_dir_override == NULL) {
       char *dar = strdup(cgfx_path);
       char *dbn = strdup(cgfx_path);
       char *dn = dirname(dar);
@@ -109,6 +157,8 @@ int main(int argc, char **argv) {
 
       free(dar);
       free(dbn);
+    } else {
+      output_dir = strdup(output_dir_override);
     }
 
 #ifdef WIN32
@@ -121,7 +171,11 @@ int main(int argc, char **argv) {
       fclose(cgfx_file);
       fprintf(stderr, "Unable to create output directory (%d)\n", errno);
       fprintf(stderr, "%s\n", strerror(errno));
-      exit(1);
+      free(output_dir);
+      if (file_buffer) {
+        free(file_buffer);
+      }
+      return 1;
     }
 
     if (verbose) {
@@ -146,11 +200,19 @@ int main(int argc, char **argv) {
       desc = "big endian, uh-oh";
       fclose(cgfx_file);
       fprintf(stderr, "big-endian files are not supported yet\n");
-      exit(1);
+      free(output_dir);
+      if (file_buffer) {
+        free(file_buffer);
+      }
+      return 1;
     } else {
       fclose(cgfx_file);
       fprintf(stderr, "invalid endianess field\n");
-      exit(1);
+      free(output_dir);
+      if (file_buffer) {
+        free(file_buffer);
+      }
+      return 1;
     }
 
     if (verbose) {
@@ -232,7 +294,10 @@ int main(int argc, char **argv) {
 #undef COND_PRINT_DICT
 
     fclose(cgfx_file);
-    exit(0);
+    if (file_buffer) {
+      free(file_buffer);
+    }
+    return 0;
   }
 
   {
@@ -617,9 +682,125 @@ int main(int argc, char **argv) {
   }
 
   fclose(cgfx_file);
-  free(output_dir);
+  if (output_dir) {
+    free(output_dir);
+  }
+  if (file_buffer) {
+    free(file_buffer);
+  }
 
   printf("OK\n");
 
   return 0;
+#undef READ_UINT32_
+}
+
+int main(int argc, char **argv) {
+  const char *cgfx_path = NULL;
+  kgflags_string("i", NULL, "The input file that should be processed", false,
+                 &cgfx_path);
+
+  const char *dir_path = NULL;
+  kgflags_string("d", NULL, "Directory path containing CGFX files to process", false,
+                 &dir_path);
+
+  char *output_dir;
+  kgflags_string("o", NULL,
+                 "Directory path which exported files should be stored in",
+                 false, (const char **)&output_dir);
+
+  bool verbose;
+  kgflags_bool("v", false, "Write more detailed output to console", false,
+               &verbose);
+
+  bool recursive;
+  kgflags_bool("r", false, "Process directories recursively (use with -d)", false,
+               &recursive);
+
+  bool list_contents;
+  kgflags_bool("l", false, "Only list file contents then stop", false,
+               &list_contents);
+
+#ifdef WIN32
+  kgflags_set_prefix("/");
+#else
+  kgflags_set_prefix("-");
+#endif
+
+  kgflags_set_custom_description("* * * * cgfx2gltf by kathrindc * * * *");
+
+  if (!kgflags_parse(argc, argv)) {
+    kgflags_print_errors();
+    printf("\n");
+    kgflags_print_usage();
+    exit(1);
+  }
+
+  // Validate that either -i or -d is provided, but not both
+  if (cgfx_path == NULL && dir_path == NULL) {
+    fprintf(stderr, "Error: Either -i (input file) or -d (directory) must be specified\n\n");
+    kgflags_print_usage();
+    exit(1);
+  }
+
+  if (cgfx_path != NULL && dir_path != NULL) {
+    fprintf(stderr, "Error: Cannot specify both -i and -d options\n\n");
+    kgflags_print_usage();
+    exit(1);
+  }
+
+  stbi_write_tga_with_rle = 0;
+
+  // Handle directory batch processing mode
+  if (dir_path != NULL) {
+    printf("Scanning directory: %s %s\n", dir_path, recursive ? "(recursive)" : "");
+    
+    // Collect all file paths
+    file_list_t file_list;
+    file_list.paths = malloc(100 * sizeof(char *)); // Initial capacity
+    file_list.capacity = 100;
+    file_list.count = 0;
+    
+    if (!file_list.paths) {
+      fprintf(stderr, "Error: Memory allocation failed\n");
+      exit(1);
+    }
+    
+    int num_files = scan_directory(dir_path, recursive, collect_file_callback, &file_list);
+    
+    if (num_files < 0) {
+      fprintf(stderr, "Error: Unable to read directory '%s'\n", dir_path);
+      free(file_list.paths);
+      exit(1);
+    } else if (num_files == 0) {
+      printf("No CGFX files found in directory\n");
+      free(file_list.paths);
+      exit(0);
+    }
+    
+    printf("Found %d CGFX file(s)\n\n", num_files);
+    
+    // Process each file
+    int errors = 0;
+    for (int i = 0; i < file_list.count; ++i) {
+      // In batch mode, each file creates its own output directory unless -o is specified
+      int result = process_single_cgfx_file(file_list.paths[i], output_dir, verbose, list_contents);
+      if (result != 0) {
+        errors++;
+        fprintf(stderr, "Failed to process: %s\n", file_list.paths[i]);
+      }
+      free(file_list.paths[i]);
+    }
+    
+    free(file_list.paths);
+    
+    printf("\n");
+    printf("Batch processing complete: %d/%d files processed successfully\n", 
+           num_files - errors, num_files);
+    
+    return errors > 0 ? 1 : 0;
+  }
+
+  // Single file processing mode
+  return process_single_cgfx_file(cgfx_path, output_dir, verbose, list_contents);
 }

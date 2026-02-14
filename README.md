@@ -42,11 +42,62 @@ $ make
 
 ## Usage
 
-So, for example, the file `some_model.bin` could be extracted like this:
+### Single File Processing
+
+Extract a single CGFX file:
 
 ```sh
-$ ./cgfx2gltf -v some_model.bin
+$ ./cgfx2gltf -i some_model.bin
 ```
+
+With verbose output:
+
+```sh
+$ ./cgfx2gltf -i some_model.bin -v
+```
+
+List contents without extracting:
+
+```sh
+$ ./cgfx2gltf -i some_model.bin -l
+```
+
+### Batch Processing
+
+Process all CGFX/BIN files in a directory:
+
+```sh
+$ ./cgfx2gltf -d path/to/models
+```
+
+Process directories recursively:
+
+```sh
+$ ./cgfx2gltf -d path/to/models -r
+```
+
+Batch processing with verbose output:
+
+```sh
+$ ./cgfx2gltf -d path/to/models -r -v
+```
+
+### LZ11 Compressed Files
+
+The tool automatically detects and decompresses LZ11-compressed CGFX files (commonly used in Nintendo 3DS games). No special flags are required - just provide the compressed file:
+
+```sh
+$ ./cgfx2gltf -i compressed_model.bin
+```
+
+### Command-Line Options
+
+* `-i` - Input file path (single file mode)
+* `-d` - Input directory path (batch mode)
+* `-o` - Output directory (optional, defaults to input filename without extension)
+* `-v` - Verbose output
+* `-r` - Recursive directory scanning (use with `-d`)
+* `-l` - List file contents only (don't extract)
 
 ## Acknowledgments
 
