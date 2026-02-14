@@ -28,6 +28,7 @@ target_include_directories(
 if(MSVC)
   add_compile_definitions(_AMD64_=1)
   add_definitions(-D_CRT_SECURE_NO_WARNINGS)
+    target_link_libraries(${PROJECT_NAME} pathcch.lib)
 else()
   target_link_libraries(${PROJECT_NAME} m)
 endif()

@@ -2,805 +2,976 @@
 #include "cgfx/data.h"
 #include "cgfx/dict.h"
 #include "cgfx/pica/shader.h"
+#include "cgltf.h"
+#include "cgltf_write.h"
 #include "common.h"
 #include "kgflags.h"
 #include "lz11.h"
 #include "stb_image.h"
 #include "stb_image_write.h"
 #include "utilities.h"
-#include "cgltf.h"
-#include "cgltf_write.h"
 
-typedef struct {
-  uint8_t is_model;
-  uint8_t is_skeleton;
-  uint32_t unk_11;
-  uint32_t unk_12_off;
-  uint8_t unk_13[12];
-  uint32_t unk_14_off;
-  float mesh_pos_offsets[3];
-  uint32_t num_face_grps;
-  uint32_t offset_face_grps_arr;
-  uint32_t unk_15;
-  uint32_t num_vert_grps;
-  uint32_t offset_vert_grps_arr;
-  uint32_t unk_16_off;
-} sobj_header;
+#ifdef _WIN32
+#include <direct.h> /* _mkdir */
+#include <windows.h>
+#else
+#include <libgen.h> /* dirname, basename */
+#endif
 
-typedef struct {
-  uint32_t num_bone_grps;
-} face_group;
-
-typedef struct {
-  char **paths;
-  int capacity;
-  int count;
-} file_list_t;
-
-static int collect_file_callback(const char *filepath, void *userdata) {
-  file_list_t *list = (file_list_t *)userdata;
-  if (list->count >= list->capacity) {
-    // Grow the array
-    int new_capacity = list->capacity * 2;
-    char **new_paths = realloc(list->paths, new_capacity * sizeof(char *));
-    if (!new_paths) {
-      return -1; // Signal error
+/* Portable basename: returns a pointer into the string after the last
+   path separator, or the string itself if none is found. */
+static const char* path_basename(const char* path)
+{
+    const char* p = path;
+    const char* last = path;
+    while (*p)
+    {
+        if (*p == '/' || *p == '\\')
+            last = p + 1;
+        p++;
     }
-    list->paths = new_paths;
-    list->capacity = new_capacity;
-  }
-  list->paths[list->count++] = strdup(filepath);
-  return 0; // Continue scanning
+    return last;
 }
 
-int process_single_cgfx_file(const char *cgfx_path, const char *output_dir_override, bool verbose, bool list_contents) {
-  FILE *cgfx_file = fopen(cgfx_path, "rb");
-  if (!cgfx_file) {
-    fprintf(stderr, "unable to open cgfx file (%d)\n", errno);
-    fprintf(stderr, "%s\n", strerror(errno));
-    return 1;
-  }
+typedef struct
+{
+    uint8_t is_model;
+    uint8_t is_skeleton;
+    uint32_t unk_11;
+    uint32_t unk_12_off;
+    uint8_t unk_13[12];
+    uint32_t unk_14_off;
+    float mesh_pos_offsets[3];
+    uint32_t num_face_grps;
+    uint32_t offset_face_grps_arr;
+    uint32_t unk_15;
+    uint32_t num_vert_grps;
+    uint32_t offset_vert_grps_arr;
+    uint32_t unk_16_off;
+} sobj_header;
 
-  // Check for LZ11 compression and decompress if needed
-  uint8_t *file_buffer = NULL;
-  size_t buffer_size = 0;
-  int is_lz11_compressed = 0;
-  
-  {
-    // Read first 4 bytes to check for LZ11 magic
-    uint8_t header[4];
-    if (fread(header, 1, 4, cgfx_file) == 4 && header[0] == 0x11) {
-      // File is LZ11 compressed
-      is_lz11_compressed = 1;
-      fseek(cgfx_file, 0, SEEK_SET);
-      
-      // Read entire file
-      fseek(cgfx_file, 0, SEEK_END);
-      long file_size = ftell(cgfx_file);
-      fseek(cgfx_file, 0, SEEK_SET);
-      
-      uint8_t *compressed_data = malloc(file_size);
-      if (!compressed_data || fread(compressed_data, 1, file_size, cgfx_file) != (size_t)file_size) {
-        fprintf(stderr, "Failed to read compressed file\n");
-        free(compressed_data);
-        fclose(cgfx_file);
-        return 1;
-      }
-      
-      fclose(cgfx_file);
-      
-      if (verbose) {
-        printf("Detected LZ11 compression, decompressing...\n");
-      }
-      
-      // Decompress
-      file_buffer = lz11_decompress(compressed_data, file_size, &buffer_size);
-      free(compressed_data);
-      
-      if (!file_buffer) {
-        fprintf(stderr, "Failed to decompress LZ11 data\n");
-        return 1;
-      }
-      
-      if (verbose) {
-        printf("Decompressed %zu bytes -> %zu bytes\n", (size_t)file_size, buffer_size);
-      }
-      
-      // Create a memory-based FILE* for reading decompressed data
-      cgfx_file = fmemopen(file_buffer, buffer_size, "rb");
-      if (!cgfx_file) {
-        fprintf(stderr, "Failed to create memory stream\n");
-        free(file_buffer);
-        return 1;
-      }
-    } else {
-      // Not compressed, reset to beginning
-      fseek(cgfx_file, 0, SEEK_SET);
-    }
-  }
+typedef struct
+{
+    uint32_t num_bone_grps;
+} face_group;
 
-  char *output_dir = NULL;
-  if (!list_contents) {
-    if (output_dir_override == NULL) {
-      char *dar = strdup(cgfx_path);
-      char *dbn = strdup(cgfx_path);
-      char *dn = dirname(dar);
-      char *bn = basename(dbn);
-      int dnl = strlen(dn);
-      int bnl = strlen(bn);
+typedef struct
+{
+    char** paths;
+    int capacity;
+    int count;
+} file_list_t;
 
-      for (int i = bnl - 1; i > 0; --i) {
-        if (bn[i] == '.') {
-          bn[i] = 0;
-          break;
+static int collect_file_callback(const char* filepath, void* userdata)
+{
+    file_list_t* list = (file_list_t*)userdata;
+    if (list->count >= list->capacity)
+    {
+        // Grow the array
+        int new_capacity = list->capacity * 2;
+        char** new_paths = realloc(list->paths, new_capacity * sizeof(char*));
+        if (!new_paths)
+        {
+            return -1; // Signal error
         }
-      }
+        list->paths = new_paths;
+        list->capacity = new_capacity;
+    }
+    list->paths[list->count++] = strdup(filepath);
+    return 0; // Continue scanning
+}
 
-      bnl = strlen(bn);
-      output_dir = malloc(dnl + 1 + bnl + 1);
+int process_single_cgfx_file(const char* cgfx_path, const char* output_dir_override, bool verbose, bool list_contents,
+                             bool save_decompressed)
+{
+#ifdef _WIN32
+    char cgfx_tmp_file[MAX_PATH] = {0};
+#endif
+    FILE* cgfx_file = fopen(cgfx_path, "rb");
+    if (!cgfx_file)
+    {
+        fprintf(stderr, "unable to open cgfx file (%d)\n", errno);
+        fprintf(stderr, "%s\n", strerror(errno));
+        return 1;
+    }
 
-      for (int i = 0; i < dnl; ++i) {
-        output_dir[i] = dn[i];
-      }
+    // Check for LZ11 compression and decompress if needed
+    uint8_t* file_buffer = NULL;
+    size_t buffer_size = 0;
+    int is_lz11_compressed = 0;
 
-#ifdef WIN32
-      output_dir[dnl] = '\\';
+    {
+        // Read first 4 bytes to check for LZ11 magic
+        uint8_t header[4];
+        if (fread(header, 1, 4, cgfx_file) == 4 && header[0] == 0x11)
+        {
+            // File is LZ11 compressed
+            is_lz11_compressed = 1;
+            fseek(cgfx_file, 0, SEEK_SET);
+
+            // Read entire file
+            fseek(cgfx_file, 0, SEEK_END);
+            long file_size = ftell(cgfx_file);
+            fseek(cgfx_file, 0, SEEK_SET);
+
+            uint8_t* compressed_data = malloc(file_size);
+            if (!compressed_data || fread(compressed_data, 1, file_size, cgfx_file) != (size_t)file_size)
+            {
+                fprintf(stderr, "Failed to read compressed file\n");
+                free(compressed_data);
+                fclose(cgfx_file);
+                return 1;
+            }
+
+            fclose(cgfx_file);
+
+            if (verbose)
+            {
+                printf("Detected LZ11 compression, decompressing...\n");
+            }
+
+            // Decompress
+            file_buffer = lz11_decompress(compressed_data, file_size, &buffer_size);
+            free(compressed_data);
+
+            if (!file_buffer)
+            {
+                fprintf(stderr, "Failed to decompress LZ11 data\n");
+                return 1;
+            }
+
+            if (save_decompressed)
+            {
+                const char* suffix = ".decompressed";
+                size_t path_len = strlen(cgfx_path);
+                size_t suffix_len = strlen(suffix);
+                char* out_path = malloc(path_len + suffix_len + 1);
+                if (!out_path)
+                {
+                    fprintf(stderr, "Failed to allocate output path for decompressed file\n");
+                    free(file_buffer);
+                    return 1;
+                }
+
+                memcpy(out_path, cgfx_path, path_len);
+                memcpy(out_path + path_len, suffix, suffix_len);
+                out_path[path_len + suffix_len] = 0;
+
+                FILE* out_file = fopen(out_path, "wb");
+                if (!out_file)
+                {
+                    fprintf(stderr, "Failed to open decompressed output file (%d)\n", errno);
+                    fprintf(stderr, "%s\n", strerror(errno));
+                    free(out_path);
+                    free(file_buffer);
+                    return 1;
+                }
+
+                if (fwrite(file_buffer, 1, buffer_size, out_file) != buffer_size)
+                {
+                    fprintf(stderr, "Failed to write decompressed output file\n");
+                    fclose(out_file);
+                    free(out_path);
+                    free(file_buffer);
+                    return 1;
+                }
+
+                fclose(out_file);
+                if (verbose)
+                {
+                    printf("Saved decompressed file to %s\n", out_path);
+                }
+                free(out_path);
+            }
+
+            if (verbose)
+            {
+                printf("Decompressed %zu bytes -> %zu bytes\n", (size_t)file_size, buffer_size);
+            }
+
+            // Create a memory-based FILE* for reading decompressed data
+#ifdef _WIN32
+            {
+                char tmp_path[MAX_PATH];
+                GetTempPathA(MAX_PATH, tmp_path);
+                GetTempFileNameA(tmp_path, "cgfx", 0, cgfx_tmp_file);
+                cgfx_file = fopen(cgfx_tmp_file, "w+b");
+                if (cgfx_file)
+                {
+                    fwrite(file_buffer, 1, buffer_size, cgfx_file);
+                    rewind(cgfx_file);
+                }
+            }
 #else
-      output_dir[dnl] = '/';
+            cgfx_file = fmemopen(file_buffer, buffer_size, "rb");
+#endif
+            if (!cgfx_file)
+            {
+                fprintf(stderr, "Failed to create memory stream\n");
+                free(file_buffer);
+                return 1;
+            }
+        }
+        else
+        {
+            // Not compressed, reset to beginning
+            fseek(cgfx_file, 0, SEEK_SET);
+        }
+    }
+
+    char* output_dir = NULL;
+    if (!list_contents)
+    {
+        if (output_dir_override == NULL)
+        {
+#ifdef _WIN32
+            char drive[_MAX_DRIVE], dir[_MAX_DIR], fname[_MAX_FNAME], ext[_MAX_EXT];
+            _splitpath_s(cgfx_path, drive, _MAX_DRIVE, dir, _MAX_DIR, fname, _MAX_FNAME, ext, _MAX_EXT);
+            /* drive + dir is the parent directory; fname is the stem without extension */
+            int dnl = (int)(strlen(drive) + strlen(dir));
+            /* strip trailing separator from dir so we add exactly one below */
+            if (dnl > 0 && (dir[strlen(dir) - 1] == '\\' || dir[strlen(dir) - 1] == '/'))
+                dnl--;
+            int bnl = (int)strlen(fname);
+            output_dir = malloc(dnl + 1 + bnl + 1);
+            /* copy drive+dir, then separator, then fname */
+            memcpy(output_dir, drive, strlen(drive));
+            memcpy(output_dir + strlen(drive), dir, strlen(dir));
+            output_dir[dnl] = '\\';
+            memcpy(output_dir + dnl + 1, fname, bnl);
+            output_dir[dnl + 1 + bnl] = 0;
+#else
+            char* dar = strdup(cgfx_path);
+            char* dbn = strdup(cgfx_path);
+            char* dn = dirname(dar);
+            char* bn = basename(dbn);
+            int dnl = strlen(dn);
+            int bnl = strlen(bn);
+
+            for (int i = bnl - 1; i > 0; --i)
+            {
+                if (bn[i] == '.')
+                {
+                    bn[i] = 0;
+                    break;
+                }
+            }
+
+            bnl = strlen(bn);
+            output_dir = malloc(dnl + 1 + bnl + 1);
+
+            for (int i = 0; i < dnl; ++i)
+            {
+                output_dir[i] = dn[i];
+            }
+
+            output_dir[dnl] = '/';
+
+            for (int i = 0; i < bnl; ++i)
+            {
+                output_dir[i + dnl + 1] = bn[i];
+            }
+
+            output_dir[dnl + 1 + bnl] = 0;
+
+            free(dar);
+            free(dbn);
+#endif
+        }
+        else
+        {
+            output_dir = strdup(output_dir_override);
+        }
+
+#ifdef _WIN32
+        int mkdir_result = _mkdir(output_dir);
+#else
+        int mkdir_result = mkdir(output_dir, S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
 #endif
 
-      for (int i = 0; i < bnl; ++i) {
-        output_dir[i + dnl + 1] = bn[i];
-      }
-
-      output_dir[dnl + 1 + bnl] = 0;
-
-      free(dar);
-      free(dbn);
-    } else {
-      output_dir = strdup(output_dir_override);
-    }
-
-#ifdef WIN32
-    int mkdir_result = _mkdir(output_dir);
-#else
-    int mkdir_result = mkdir(output_dir, S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
+        if (mkdir_result != 0 && errno != EEXIST)
+        {
+            fclose(cgfx_file);
+#ifdef _WIN32
+            if (cgfx_tmp_file[0])
+                DeleteFileA(cgfx_tmp_file);
 #endif
+            fprintf(stderr, "Unable to create output directory (%d)\n", errno);
+            fprintf(stderr, "%s\n", strerror(errno));
+            free(output_dir);
+            if (file_buffer)
+            {
+                free(file_buffer);
+            }
+            return 1;
+        }
 
-    if (mkdir_result != 0 && errno != EEXIST) {
-      fclose(cgfx_file);
-      fprintf(stderr, "Unable to create output directory (%d)\n", errno);
-      fprintf(stderr, "%s\n", strerror(errno));
-      free(output_dir);
-      if (file_buffer) {
-        free(file_buffer);
-      }
-      return 1;
+        if (verbose)
+        {
+            printf("output directory = %s\n", output_dir);
+        }
     }
 
-    if (verbose) {
-      printf("output directory = %s\n", output_dir);
-    }
-  }
+    magic_eq(cgfx_file, "CGFX", 0);
 
-  magic_eq(cgfx_file, "CGFX", 0);
-
-  if (verbose) {
-    printf("header info:\n");
-  }
-
-  {
-    uint8_t endianess[2];
-    assert(fread(endianess, 1, 2, cgfx_file) == 2);
-
-    char *desc;
-    if (endianess[0] == 0xFF && endianess[1] == 0xFE) {
-      desc = "little endian";
-    } else if (endianess[0] == 0xFE && endianess[1] == 0xFF) {
-      desc = "big endian, uh-oh";
-      fclose(cgfx_file);
-      fprintf(stderr, "big-endian files are not supported yet\n");
-      free(output_dir);
-      if (file_buffer) {
-        free(file_buffer);
-      }
-      return 1;
-    } else {
-      fclose(cgfx_file);
-      fprintf(stderr, "invalid endianess field\n");
-      free(output_dir);
-      if (file_buffer) {
-        free(file_buffer);
-      }
-      return 1;
+    if (verbose)
+    {
+        printf("header info:\n");
     }
 
-    if (verbose) {
-      printf("  endianess: %s (0x%02x%02x)\n", desc, endianess[0],
-             endianess[1]);
-    }
-  }
+    {
+        uint8_t endianess[2];
+        assert(fread(endianess, 1, 2, cgfx_file) == 2);
 
-  {
-    uint16_t header_size;
-    assert(fread(&header_size, 2, 1, cgfx_file) == 1);
+        char* desc;
+        if (endianess[0] == 0xFF && endianess[1] == 0xFE)
+        {
+            desc = "little endian";
+        }
+        else if (endianess[0] == 0xFE && endianess[1] == 0xFF)
+        {
+            desc = "big endian, uh-oh";
+            fclose(cgfx_file);
+#ifdef _WIN32
+            if (cgfx_tmp_file[0])
+                DeleteFileA(cgfx_tmp_file);
+#endif
+            fprintf(stderr, "big-endian files are not supported yet\n");
+            free(output_dir);
+            if (file_buffer)
+            {
+                free(file_buffer);
+            }
+            return 1;
+        }
+        else
+        {
+            fclose(cgfx_file);
+#ifdef _WIN32
+            if (cgfx_tmp_file[0])
+                DeleteFileA(cgfx_tmp_file);
+#endif
+            fprintf(stderr, "invalid endianess field\n");
+            free(output_dir);
+            if (file_buffer)
+            {
+                free(file_buffer);
+            }
+            return 1;
+        }
 
-    if (verbose) {
-      printf("header size: %uh bytes\n", header_size);
+        if (verbose)
+        {
+            printf("  endianess: %s (0x%02x%02x)\n", desc, endianess[0], endianess[1]);
+        }
     }
-  }
+
+    {
+        uint16_t header_size;
+        assert(fread(&header_size, 2, 1, cgfx_file) == 1);
+
+        if (verbose)
+        {
+            printf("header size: %uh bytes\n", header_size);
+        }
+    }
 
 #define READ_UINT32_(var) READ_UINT32(cgfx_file, var)
 
-  {
-    uint32_t revision;
-    READ_UINT32_(&revision);
+    {
+        uint32_t revision;
+        READ_UINT32_(&revision);
 
-    if (verbose) {
-      printf("revision: %u\n", revision);
+        if (verbose)
+        {
+            printf("revision: %u\n", revision);
+        }
     }
-  }
 
-  {
-    uint32_t file_size;
-    READ_UINT32_(&file_size);
+    {
+        uint32_t file_size;
+        READ_UINT32_(&file_size);
 
-    if (verbose) {
-      printf("file size: %u bytes\n", file_size);
+        if (verbose)
+        {
+            printf("file size: %u bytes\n", file_size);
+        }
     }
-  }
 
-  // NOTE: This field is basically useless to us, but we just still read it
-  //       so the file cursor advances. Maybe we'll use it later.
-  uint32_t num_entries;
-  READ_UINT32_(&num_entries);
+    // NOTE: This field is basically useless to us, but we just still read it
+    //       so the file cursor advances. Maybe we'll use it later.
+    uint32_t num_entries;
+    READ_UINT32_(&num_entries);
 
-  data_section data;
-  memset(&data, 0, sizeof(data_section));
-  data.offset = ftell(cgfx_file);
+    data_section data;
+    memset(&data, 0, sizeof(data_section));
+    data.offset = ftell(cgfx_file);
 
-  magic_eq(cgfx_file, "DATA", 0);
-  READ_UINT32_(&data.size);
+    magic_eq(cgfx_file, "DATA", 0);
+    READ_UINT32_(&data.size);
 
-  for (int i = 0; i < TYPE__COUNT; ++i) {
-    read_dict_indirect(cgfx_file, &data.dicts[i]);
-  }
+    for (int i = 0; i < TYPE__COUNT; ++i)
+    {
+        read_dict_indirect(cgfx_file, &data.dicts[i]);
+    }
 
-  if (list_contents) {
-    printf("%s contains:\n", basename((char *)cgfx_path));
+    if (list_contents)
+    {
+        printf("%s contains:\n", path_basename(cgfx_path));
 
-#define COND_PRINT_DICT(t, n)                                                  \
-  if (data.dicts[t].num_entries) {                                             \
-    printf("  - %d " n "\n", data.dicts[t].num_entries);                       \
-  }
+#define COND_PRINT_DICT(t, n)                                                                                          \
+    if (data.dicts[t].num_entries)                                                                                     \
+    {                                                                                                                  \
+        printf("  - %d " n "\n", data.dicts[t].num_entries);                                                           \
+    }
 
-    COND_PRINT_DICT(TYPE_MODEL, "models");
-    COND_PRINT_DICT(TYPE_TEXTURE, "textures");
-    COND_PRINT_DICT(TYPE_LUTS, "LUTs");
-    COND_PRINT_DICT(TYPE_MATERIAL, "materials");
-    COND_PRINT_DICT(TYPE_SHADER, "shaders");
-    COND_PRINT_DICT(TYPE_CAMERA, "cameras");
-    COND_PRINT_DICT(TYPE_LIGHT, "lights");
-    COND_PRINT_DICT(TYPE_FOG, "fogs");
-    COND_PRINT_DICT(TYPE_SCENE, "scenes");
-    COND_PRINT_DICT(TYPE_ANIM_SKEL, "skeletal animations");
-    COND_PRINT_DICT(TYPE_ANIM_TEX, "texture animations");
-    COND_PRINT_DICT(TYPE_ANIM_VIS, "visibility animations");
-    COND_PRINT_DICT(TYPE_ANIM_CAM, "camera animations");
-    COND_PRINT_DICT(TYPE_ANIM_LIGHT, "light animations");
-    COND_PRINT_DICT(TYPE_EMITTER, "emitters");
-    COND_PRINT_DICT(TYPE_PARTICLE, "particles");
+        COND_PRINT_DICT(TYPE_MODEL, "models");
+        COND_PRINT_DICT(TYPE_TEXTURE, "textures");
+        COND_PRINT_DICT(TYPE_LUTS, "LUTs");
+        COND_PRINT_DICT(TYPE_MATERIAL, "materials");
+        COND_PRINT_DICT(TYPE_SHADER, "shaders");
+        COND_PRINT_DICT(TYPE_CAMERA, "cameras");
+        COND_PRINT_DICT(TYPE_LIGHT, "lights");
+        COND_PRINT_DICT(TYPE_FOG, "fogs");
+        COND_PRINT_DICT(TYPE_SCENE, "scenes");
+        COND_PRINT_DICT(TYPE_ANIM_SKEL, "skeletal animations");
+        COND_PRINT_DICT(TYPE_ANIM_TEX, "texture animations");
+        COND_PRINT_DICT(TYPE_ANIM_VIS, "visibility animations");
+        COND_PRINT_DICT(TYPE_ANIM_CAM, "camera animations");
+        COND_PRINT_DICT(TYPE_ANIM_LIGHT, "light animations");
+        COND_PRINT_DICT(TYPE_EMITTER, "emitters");
+        COND_PRINT_DICT(TYPE_PARTICLE, "particles");
 
 #undef COND_PRINT_DICT
 
-    fclose(cgfx_file);
-    if (file_buffer) {
-      free(file_buffer);
-    }
-    return 0;
-  }
-
-  {
-    char *cgfx_name = strdup(cgfx_path);
-    printf("Converting %s ...%c", basename(cgfx_name), verbose ? '\n' : ' ');
-    free(cgfx_name);
-  }
-
-  for (int i = 0; i < data.dicts[TYPE_TEXTURE].num_entries; ++i) {
-    dict_entry *entry = data.dicts[TYPE_TEXTURE].entries + i;
-    char *name = read_string_alloc(cgfx_file, entry->offset_name);
-
-    if (verbose) {
-      printf("extracting texture \"%s\"\n", name);
+        fclose(cgfx_file);
+#ifdef _WIN32
+        if (cgfx_tmp_file[0])
+            DeleteFileA(cgfx_tmp_file);
+#endif
+        if (file_buffer)
+        {
+            free(file_buffer);
+        }
+        return 0;
     }
 
-    fseek(cgfx_file, entry->offset_data, SEEK_SET);
-
-    txob_header txob;
-    READ_UINT32_(&txob.type);
-    magic_eq(cgfx_file, "TXOB", 0);
-    READ_UINT32_(&txob.revision);
-    read_rel_offset(cgfx_file, &txob.offset_name);
-    read_dict_indirect(cgfx_file, &txob.user_data);
-    READ_UINT32_(&txob.height);
-    READ_UINT32_(&txob.width);
-    READ_UINT32_(&txob.gl_format);
-    READ_UINT32_(&txob.gl_type);
-    READ_UINT32_(&txob.mipmap_levels);
-    READ_UINT32_(&txob.tex_obj);
-    READ_UINT32_(&txob.location_flags);
-    READ_UINT32_(&txob.format);
-    READ_UINT32_(&txob.unk_19);
-    READ_UINT32_(&txob.unk_20);
-    READ_UINT32_(&txob.unk_21);
-    READ_UINT32_(&txob.data_length);
-    read_rel_offset(cgfx_file, &txob.data_offset);
-    READ_UINT32_(&txob.dyn_alloc);
-    READ_UINT32_(&txob.bpp);
-    READ_UINT32_(&txob.location_address);
-    READ_UINT32_(&txob.memory_address);
-
-    uint8_t *data = malloc(txob.data_length);
-    uint8_t *pixels;
-
-    fseek(cgfx_file, txob.data_offset, SEEK_SET);
-    assert(fread(data, 1, txob.data_length, cgfx_file) == txob.data_length);
-
-    pica200_texture_decode(data, txob.width, txob.height, txob.format, &pixels);
-    free(data);
-
-    if (pixels == NULL) {
-      fprintf(stderr, "Error: Texture \"%s\" has unsupported format 0x%08x\n",
-              name, txob.format);
-      continue;
+    {
+        printf("Converting %s ...%c", path_basename(cgfx_path), verbose ? '\n' : ' ');
     }
 
-    char *tga_path = make_file_path(output_dir, name, ".tga");
-    int write_ok = stbi_write_tga(tga_path, txob.width, txob.height, 4, pixels);
+    for (int i = 0; i < data.dicts[TYPE_TEXTURE].num_entries; ++i)
+    {
+        dict_entry* entry = data.dicts[TYPE_TEXTURE].entries + i;
+        char* name = read_string_alloc(cgfx_file, entry->offset_name);
 
-    free(pixels);
-    free(tga_path);
-
-    if (!write_ok) {
-      fprintf(stderr, "Error: Failed to write \"%s\" to disk\n", name);
-      continue;
-    }
-
-    if (verbose) {
-      printf("Texture \"%s\" saved as TGA image\n", name);
-    }
-  }
-
-  for (int model_index = 0; model_index < data.dicts[TYPE_MODEL].num_entries;
-       ++model_index) {
-    dict_entry *model_entry = data.dicts[TYPE_MODEL].entries + model_index;
-    uint32_t flags;
-    cmdl_header cmdl;
-
-    fseek(cgfx_file, model_entry->offset_data, SEEK_SET);
-
-    READ_UINT32_(&flags);
-    cmdl.has_skeleton = (flags & 0x80) > 0;
-
-    magic_eq(cgfx_file, "CMDL", 0);
-    READ_UINT32_(&cmdl.revision);
-    read_rel_offset(cgfx_file, &cmdl.offset_name);
-    read_dict_indirect(cgfx_file, &cmdl.user_data);
-    READ_UINT32_(&cmdl.unk_17);
-
-    READ_UINT32_(&flags);
-    cmdl.is_branch_visible = (flags & 1) > 0;
-
-    READ_UINT32_(&cmdl.num_children);
-    READ_UINT32_(&cmdl.unk_18);
-    read_dict_indirect(cgfx_file, &cmdl.animation_groups);
-    read_vec3f(cgfx_file, cmdl.transform_scale_vec);
-    read_vec3f(cgfx_file, cmdl.transform_rotate_vec);
-    read_vec3f(cgfx_file, cmdl.transform_translate_vec);
-    read_mat4x3f(cgfx_file, cmdl.local_matrix);
-    read_mat4x3f(cgfx_file, cmdl.world_matrix);
-    read_dict_indirect(cgfx_file, &cmdl.objects);
-    read_dict_indirect(cgfx_file, &cmdl.materials);
-    read_dict_indirect(cgfx_file, &cmdl.shapes);
-    read_dict_indirect(cgfx_file, &cmdl.nodes);
-
-    READ_UINT32_(&flags);
-    cmdl.is_visible = (flags & 1) > 0;
-    cmdl.is_non_uniform_scalable = (flags & 0x100) > 0;
-
-    READ_UINT32_(&cmdl.cull_mode);
-    READ_UINT32_(&cmdl.layer_id);
-
-    if (cmdl.has_skeleton) {
-      read_rel_offset(cgfx_file, &cmdl.offset_skel_info);
-    }
-
-    for (int material_index = 0; material_index < cmdl.materials.num_entries;
-         ++material_index) {
-      mtob_header mtob;
-
-      READ_UINT32_(&flags);
-      magic_eq(cgfx_file, "MTOB", 0);
-      READ_UINT32_(&mtob.revision);
-      read_rel_offset(cgfx_file, &mtob.offset_name);
-      read_dict_indirect(cgfx_file, &mtob.user_data);
-
-      READ_UINT32_(&flags);
-      mtob.is_fragment_light_enabled = (flags & 1) > 0;
-      mtob.is_vertex_light_enabled = (flags & 2) > 0;
-      mtob.is_hemisphere_light_enabled = (flags & 4) > 0;
-      mtob.is_hemisphere_occlusion_enabled = (flags & 8) > 0;
-      mtob.is_fog_enabled = (flags & 0x16) > 0;
-
-      READ_UINT32_(&mtob.texture_coords_config);
-      READ_UINT32_(&mtob.translucency_kind);
-
-      // Skip colours stored as floats
-      fseek(cgfx_file, 44, SEEK_CUR);
-
-      read_rgba(cgfx_file, &mtob.colour.emission);
-      read_rgba(cgfx_file, &mtob.colour.ambient);
-      read_rgba(cgfx_file, &mtob.colour.diffuse);
-      read_rgba(cgfx_file, &mtob.colour.specular_0);
-      read_rgba(cgfx_file, &mtob.colour.specular_1);
-      read_rgba(cgfx_file, &mtob.colour.constant_0);
-      read_rgba(cgfx_file, &mtob.colour.constant_1);
-      read_rgba(cgfx_file, &mtob.colour.constant_2);
-      read_rgba(cgfx_file, &mtob.colour.constant_3);
-      read_rgba(cgfx_file, &mtob.colour.constant_4);
-      read_rgba(cgfx_file, &mtob.colour.constant_5);
-
-      READ_UINT32_(&flags);
-      mtob.rasterisation.is_polygon_offset_enabled = (flags & 1) > 0;
-
-      READ_UINT32_(&mtob.rasterisation.cull_mode);
-      READ_UINT32_(&mtob.rasterisation.polygon_offset_unit);
-
-      fseek(cgfx_file, 12, SEEK_CUR);
-
-      // Read depth fragment test
-      {
-        pica_command_reader depth_cmdr;
-
-        READ_UINT32_(&flags);
-        pica_cmdr_new(cgfx_file, 4, 1, &depth_cmdr);
-        mtob.fragment_operation.depth = pica_cmdr_get_depth_test(&depth_cmdr);
-        mtob.fragment_operation.depth.is_test_enabled = (flags & 1) > 0;
-        mtob.fragment_operation.depth.is_mask_enabled = (flags & 2) > 0;
-        pica_cmdr_destroy(&depth_cmdr);
-      }
-
-      // Read blend fragment operation
-      {
-        pica_command_reader blend_cmdr;
-        uint32_t blend_mode;
-        uint32_t blend_colour;
-
-        READ_UINT32_(&blend_mode);
-        switch (blend_mode) {
-        case 1:
-        case 2:
-          blend_mode = BLEND_MODE_BLEND;
-          break;
-
-        case 3:
-          blend_mode = BLEND_MODE_LOGICAL;
-          break;
-
-        default:
-          blend_mode = BLEND_MODE_NOT_USED;
-          break;
+        if (verbose)
+        {
+            printf("extracting texture \"%s\"\n", name);
         }
 
-        read_float_rgba(cgfx_file, &blend_colour);
-        pica_cmdr_new(cgfx_file, 5, 1, &blend_cmdr);
-        mtob.fragment_operation.blend =
-            pica_cmdr_get_blend_operation(&blend_cmdr);
-        mtob.fragment_operation.blend.mode = blend_mode;
-        mtob.fragment_operation.blend.colour = blend_colour;
-        pica_cmdr_destroy(&blend_cmdr);
-      }
+        fseek(cgfx_file, entry->offset_data, SEEK_SET);
 
-      // Read stencil fragment test
-      {
-        pica_command_reader stencil_cmdr;
+        txob_header txob;
+        READ_UINT32_(&txob.type);
+        magic_eq(cgfx_file, "TXOB", 0);
+        READ_UINT32_(&txob.revision);
+        read_rel_offset(cgfx_file, &txob.offset_name);
+        read_dict_indirect(cgfx_file, &txob.user_data);
+        READ_UINT32_(&txob.height);
+        READ_UINT32_(&txob.width);
+        READ_UINT32_(&txob.gl_format);
+        READ_UINT32_(&txob.gl_type);
+        READ_UINT32_(&txob.mipmap_levels);
+        READ_UINT32_(&txob.tex_obj);
+        READ_UINT32_(&txob.location_flags);
+        READ_UINT32_(&txob.format);
+        READ_UINT32_(&txob.unk_19);
+        READ_UINT32_(&txob.unk_20);
+        READ_UINT32_(&txob.unk_21);
+        READ_UINT32_(&txob.data_length);
+        read_rel_offset(cgfx_file, &txob.data_offset);
+        READ_UINT32_(&txob.dyn_alloc);
+        READ_UINT32_(&txob.bpp);
+        READ_UINT32_(&txob.location_address);
+        READ_UINT32_(&txob.memory_address);
 
-        READ_UINT32_(&flags);
-        pica_cmdr_new(cgfx_file, 4, 1, &stencil_cmdr);
-        mtob.fragment_operation.stencil =
-            pica_cmdr_get_stencil_test(&stencil_cmdr);
-        pica_cmdr_destroy(&stencil_cmdr);
-      }
+        uint8_t* data = malloc(txob.data_length);
+        uint8_t* pixels;
 
-      // Texture coordinates
-      uint32_t used_tex_coordinates;
-      READ_UINT32_(&used_tex_coordinates);
+        fseek(cgfx_file, txob.data_offset, SEEK_SET);
+        assert(fread(data, 1, txob.data_length, cgfx_file) == txob.data_length);
 
-      for (uint32_t i = 0; i < 3; ++i) {
-        texture_coordinator coordinator;
-        uint32_t source_coordinate;
-        uint32_t matrix_mode;
+        pica200_texture_decode(data, txob.width, txob.height, txob.format, &pixels);
+        free(data);
 
-        READ_UINT32_(&source_coordinate);
-        READ_UINT32_(&coordinator.projection);
-        READ_UINT32_(&coordinator.reference_cam);
-        READ_UINT32_(&matrix_mode);
-        assert(fread(&coordinator.scale_u, 4, 1, cgfx_file) == 1);
-        assert(fread(&coordinator.scale_v, 4, 1, cgfx_file) == 1);
-        assert(fread(&coordinator.rotate, 4, 1, cgfx_file) == 1);
-        assert(fread(&coordinator.translate_u, 4, 1, cgfx_file) == 1);
-        assert(fread(&coordinator.translate_v, 4, 1, cgfx_file) == 1);
-        READ_UINT32_(&flags);
-
-        float transform_matrix[12];
-        read_mat4x3f(cgfx_file, transform_matrix);
-
-        mtob.texture_coordinators[i] = coordinator;
-      }
-
-      // Texture mappers
-      uint32_t mapper_offsets[4];
-      read_rel_offset(cgfx_file, mapper_offsets);
-      read_rel_offset(cgfx_file, mapper_offsets + 1);
-      read_rel_offset(cgfx_file, mapper_offsets + 2);
-      read_rel_offset(cgfx_file, mapper_offsets + 3);
-
-      {
-        uint32_t position = ftell(cgfx_file);
-
-        for (uint32_t i = 0; i < 3; ++i) {
-          if (mapper_offsets[i] == 0) {
+        if (pixels == NULL)
+        {
+            fprintf(stderr, "Error: Texture \"%s\" has unsupported format 0x%08x\n", name, txob.format);
             continue;
-          }
-
-          uint32_t dynamic_allocator;
-          uint32_t texture_header_offset;
-          uint32_t sampler_offset;
-
-          READ_UINT32_(&flags);
-          READ_UINT32_(&dynamic_allocator);
-          read_rel_offset(cgfx_file, &texture_header_offset);
-          read_rel_offset(cgfx_file, &sampler_offset);
-
-          pica_command_reader cmdr;
-          pica_cmdr_new(cgfx_file, 13, 1, &cmdr);
-
-          mtob.texture_mappings[i] = pica_cmdr_get_tex_unit_mapper(&cmdr, i);
-          mtob.texture_mappings[i].border_colour =
-              pica_cmdr_get_tex_unit_border_colour(&cmdr, i);
-
-          pica_cmdr_destroy(&cmdr);
-
-          fseek(cgfx_file, texture_header_offset + 0x18, SEEK_SET);
-          read_rel_offset(cgfx_file, mtob.offset_alt_names + i);
-
-          fseek(cgfx_file, sampler_offset + 0x10, SEEK_SET);
-          assert(fread(&mtob.texture_mappings[i].lod_bias, 4, 1, cgfx_file) ==
-                 1);
         }
 
-        fseek(cgfx_file, position, SEEK_SET);
-      }
+        char* tga_path = make_file_path(output_dir, name, ".tga");
+        int write_ok = stbi_write_tga(tga_path, txob.width, txob.height, 4, pixels);
 
-      // Shader meta info
-      uint32_t shader_offset;
-      uint32_t frag_shader_offset;
-      uint32_t shader_prog_descript_index;
-      uint32_t num_shader_params;
-      uint32_t shader_param_ptable_offset;
-      uint32_t material_id;
+        free(pixels);
+        free(tga_path);
 
-      read_rel_offset(cgfx_file, &shader_offset);
-      read_rel_offset(cgfx_file, &frag_shader_offset);
-      READ_UINT32_(&shader_prog_descript_index);
-      READ_UINT32_(&num_shader_params);
-      read_rel_offset(cgfx_file, &shader_param_ptable_offset);
-      READ_UINT32_(&mtob.light_set_index);
-      READ_UINT32_(&mtob.fog_index);
-
-      // NOTE: Skip the hashes, we don't need them
-      fseek(cgfx_file, 0x30, SEEK_CUR);
-
-      READ_UINT32_(&material_id);
-
-      // Shader
-      if (shader_offset) {
-        READ_UINT32_(&flags);
-        magic_eq(cgfx_file, "SHDR", 0);
-        fseek(cgfx_file, 4, SEEK_CUR);
-        read_rel_offset(cgfx_file, &mtob.shader_ref.id_offset);
-        read_dict_indirect(cgfx_file, &mtob.user_data);
-        read_rel_offset(cgfx_file, &mtob.shader_ref.name_offset);
-        fseek(cgfx_file, 4, SEEK_CUR);
-      }
-
-      // Fragment shader
-      if (frag_shader_offset) {
-        fseek(cgfx_file, frag_shader_offset, SEEK_SET);
-        read_float_rgba(cgfx_file, &mtob.fragment_shader.buffer_colour);
-
-        READ_UINT32_(&flags);
-        mtob.fragment_shader.is_clamp_highlight = flags & 1;
-        mtob.fragment_shader.is_dist0_enabled = (flags & 2) > 0;
-        mtob.fragment_shader.is_dist1_enabled = (flags & 4) > 0;
-        mtob.fragment_shader.is_geomfac0_enabled = (flags & 8) > 0;
-        mtob.fragment_shader.is_geomfac1_enabled = (flags & 16) > 0;
-        mtob.fragment_shader.is_reflect_enabled = (flags & 32) > 0;
-
-        READ_UINT32_(&mtob.fragment_shader.layer_config);
-        READ_UINT32_(&mtob.fragment_shader.fresnel_config);
-        READ_UINT32_(&mtob.fragment_shader.bump_texture);
-        READ_UINT32_(&mtob.fragment_shader.bump_mode);
-
-        READ_UINT32_(&flags);
-        mtob.fragment_shader.bump_renormalise = flags & 1;
-
-        uint32_t frag_light_table_offset;
-        read_rel_offset(cgfx_file, &frag_light_table_offset);
-
+        if (!write_ok)
         {
-          uint32_t previous_pos = ftell(cgfx_file);
-          fseek(cgfx_file, frag_light_table_offset, SEEK_SET);
-
-          read_frag_sampler_indirect(cgfx_file,
-                                     &mtob.fragment_shader.reflect_red);
-          read_frag_sampler_indirect(cgfx_file,
-                                     &mtob.fragment_shader.reflect_green);
-          read_frag_sampler_indirect(cgfx_file,
-                                     &mtob.fragment_shader.reflect_blue);
-          read_frag_sampler_indirect(cgfx_file, &mtob.fragment_shader.dist0);
-          read_frag_sampler_indirect(cgfx_file, &mtob.fragment_shader.dist1);
-          read_frag_sampler_indirect(cgfx_file, &mtob.fragment_shader.fresnel);
-
-          fseek(cgfx_file, previous_pos, SEEK_SET);
+            fprintf(stderr, "Error: Failed to write \"%s\" to disk\n", name);
+            continue;
         }
 
-        for (uint32_t stage = PICA_TEV_STAGE0; stage <= PICA_TEV_STAGE5;
-             ++stage) {
-          pica_command_reader reader;
-          fseek(cgfx_file, 4, SEEK_CUR);
-
-          pica_cmdr_new(cgfx_file, 6, 1, &reader);
-
-          mtob.fragment_shader.combiners[stage] =
-              pica_cmdr_get_tev_stage(&reader, stage);
-
-          pica_cmdr_destroy(&reader);
-        }
-
-        // Read alpha test
+        if (verbose)
         {
-          pica_command_reader reader;
-          pica_cmdr_new(cgfx_file, 2, 1, &reader);
-
-          mtob.fragment_shader.alpha_test = pica_cmdr_get_alpha_test(&reader);
-
-          pica_cmdr_destroy(&reader);
+            printf("Texture \"%s\" saved as TGA image\n", name);
         }
-      }
     }
-  }
 
-  fclose(cgfx_file);
-  if (output_dir) {
-    free(output_dir);
-  }
-  if (file_buffer) {
-    free(file_buffer);
-  }
+    for (int model_index = 0; model_index < data.dicts[TYPE_MODEL].num_entries; ++model_index)
+    {
+        dict_entry* model_entry = data.dicts[TYPE_MODEL].entries + model_index;
+        uint32_t flags;
+        cmdl_header cmdl;
 
-  printf("OK\n");
+        fseek(cgfx_file, model_entry->offset_data, SEEK_SET);
 
-  return 0;
+        READ_UINT32_(&flags);
+        cmdl.has_skeleton = (flags & 0x80) > 0;
+
+        magic_eq(cgfx_file, "CMDL", 0);
+        READ_UINT32_(&cmdl.revision);
+        read_rel_offset(cgfx_file, &cmdl.offset_name);
+        read_dict_indirect(cgfx_file, &cmdl.user_data);
+        READ_UINT32_(&cmdl.unk_17);
+
+        READ_UINT32_(&flags);
+        cmdl.is_branch_visible = (flags & 1) > 0;
+
+        READ_UINT32_(&cmdl.num_children);
+        READ_UINT32_(&cmdl.unk_18);
+        read_dict_indirect(cgfx_file, &cmdl.animation_groups);
+        read_vec3f(cgfx_file, cmdl.transform_scale_vec);
+        read_vec3f(cgfx_file, cmdl.transform_rotate_vec);
+        read_vec3f(cgfx_file, cmdl.transform_translate_vec);
+        read_mat4x3f(cgfx_file, cmdl.local_matrix);
+        read_mat4x3f(cgfx_file, cmdl.world_matrix);
+        read_dict_indirect(cgfx_file, &cmdl.objects);
+        read_dict_indirect(cgfx_file, &cmdl.materials);
+        read_dict_indirect(cgfx_file, &cmdl.shapes);
+        read_dict_indirect(cgfx_file, &cmdl.nodes);
+
+        READ_UINT32_(&flags);
+        cmdl.is_visible = (flags & 1) > 0;
+        cmdl.is_non_uniform_scalable = (flags & 0x100) > 0;
+
+        READ_UINT32_(&cmdl.cull_mode);
+        READ_UINT32_(&cmdl.layer_id);
+
+        if (cmdl.has_skeleton)
+        {
+            read_rel_offset(cgfx_file, &cmdl.offset_skel_info);
+        }
+
+        for (int material_index = 0; material_index < cmdl.materials.num_entries; ++material_index)
+        {
+            mtob_header mtob;
+
+            READ_UINT32_(&flags);
+            magic_eq(cgfx_file, "MTOB", 0);
+            READ_UINT32_(&mtob.revision);
+            read_rel_offset(cgfx_file, &mtob.offset_name);
+            read_dict_indirect(cgfx_file, &mtob.user_data);
+
+            READ_UINT32_(&flags);
+            mtob.is_fragment_light_enabled = (flags & 1) > 0;
+            mtob.is_vertex_light_enabled = (flags & 2) > 0;
+            mtob.is_hemisphere_light_enabled = (flags & 4) > 0;
+            mtob.is_hemisphere_occlusion_enabled = (flags & 8) > 0;
+            mtob.is_fog_enabled = (flags & 0x16) > 0;
+
+            READ_UINT32_(&mtob.texture_coords_config);
+            READ_UINT32_(&mtob.translucency_kind);
+
+            // Skip colours stored as floats
+            fseek(cgfx_file, 44, SEEK_CUR);
+
+            read_rgba(cgfx_file, &mtob.colour.emission);
+            read_rgba(cgfx_file, &mtob.colour.ambient);
+            read_rgba(cgfx_file, &mtob.colour.diffuse);
+            read_rgba(cgfx_file, &mtob.colour.specular_0);
+            read_rgba(cgfx_file, &mtob.colour.specular_1);
+            read_rgba(cgfx_file, &mtob.colour.constant_0);
+            read_rgba(cgfx_file, &mtob.colour.constant_1);
+            read_rgba(cgfx_file, &mtob.colour.constant_2);
+            read_rgba(cgfx_file, &mtob.colour.constant_3);
+            read_rgba(cgfx_file, &mtob.colour.constant_4);
+            read_rgba(cgfx_file, &mtob.colour.constant_5);
+
+            READ_UINT32_(&flags);
+            mtob.rasterisation.is_polygon_offset_enabled = (flags & 1) > 0;
+
+            READ_UINT32_(&mtob.rasterisation.cull_mode);
+            READ_UINT32_(&mtob.rasterisation.polygon_offset_unit);
+
+            fseek(cgfx_file, 12, SEEK_CUR);
+
+            // Read depth fragment test
+            {
+                pica_command_reader depth_cmdr;
+
+                READ_UINT32_(&flags);
+                pica_cmdr_new(cgfx_file, 4, 1, &depth_cmdr);
+                mtob.fragment_operation.depth = pica_cmdr_get_depth_test(&depth_cmdr);
+                mtob.fragment_operation.depth.is_test_enabled = (flags & 1) > 0;
+                mtob.fragment_operation.depth.is_mask_enabled = (flags & 2) > 0;
+                pica_cmdr_destroy(&depth_cmdr);
+            }
+
+            // Read blend fragment operation
+            {
+                pica_command_reader blend_cmdr;
+                uint32_t blend_mode;
+                uint32_t blend_colour;
+
+                READ_UINT32_(&blend_mode);
+                switch (blend_mode)
+                {
+                    case 1:
+                    case 2:
+                        blend_mode = BLEND_MODE_BLEND;
+                        break;
+
+                    case 3:
+                        blend_mode = BLEND_MODE_LOGICAL;
+                        break;
+
+                    default:
+                        blend_mode = BLEND_MODE_NOT_USED;
+                        break;
+                }
+
+                read_float_rgba(cgfx_file, &blend_colour);
+                pica_cmdr_new(cgfx_file, 5, 1, &blend_cmdr);
+                mtob.fragment_operation.blend = pica_cmdr_get_blend_operation(&blend_cmdr);
+                mtob.fragment_operation.blend.mode = blend_mode;
+                mtob.fragment_operation.blend.colour = blend_colour;
+                pica_cmdr_destroy(&blend_cmdr);
+            }
+
+            // Read stencil fragment test
+            {
+                pica_command_reader stencil_cmdr;
+
+                READ_UINT32_(&flags);
+                pica_cmdr_new(cgfx_file, 4, 1, &stencil_cmdr);
+                mtob.fragment_operation.stencil = pica_cmdr_get_stencil_test(&stencil_cmdr);
+                pica_cmdr_destroy(&stencil_cmdr);
+            }
+
+            // Texture coordinates
+            uint32_t used_tex_coordinates;
+            READ_UINT32_(&used_tex_coordinates);
+
+            for (uint32_t i = 0; i < 3; ++i)
+            {
+                texture_coordinator coordinator;
+                uint32_t source_coordinate;
+                uint32_t matrix_mode;
+
+                READ_UINT32_(&source_coordinate);
+                READ_UINT32_(&coordinator.projection);
+                READ_UINT32_(&coordinator.reference_cam);
+                READ_UINT32_(&matrix_mode);
+                assert(fread(&coordinator.scale_u, 4, 1, cgfx_file) == 1);
+                assert(fread(&coordinator.scale_v, 4, 1, cgfx_file) == 1);
+                assert(fread(&coordinator.rotate, 4, 1, cgfx_file) == 1);
+                assert(fread(&coordinator.translate_u, 4, 1, cgfx_file) == 1);
+                assert(fread(&coordinator.translate_v, 4, 1, cgfx_file) == 1);
+                READ_UINT32_(&flags);
+
+                float transform_matrix[12];
+                read_mat4x3f(cgfx_file, transform_matrix);
+
+                mtob.texture_coordinators[i] = coordinator;
+            }
+
+            // Texture mappers
+            uint32_t mapper_offsets[4];
+            read_rel_offset(cgfx_file, mapper_offsets);
+            read_rel_offset(cgfx_file, mapper_offsets + 1);
+            read_rel_offset(cgfx_file, mapper_offsets + 2);
+            read_rel_offset(cgfx_file, mapper_offsets + 3);
+
+            {
+                uint32_t position = ftell(cgfx_file);
+
+                for (uint32_t i = 0; i < 3; ++i)
+                {
+                    if (mapper_offsets[i] == 0)
+                    {
+                        continue;
+                    }
+
+                    uint32_t dynamic_allocator;
+                    uint32_t texture_header_offset;
+                    uint32_t sampler_offset;
+
+                    READ_UINT32_(&flags);
+                    READ_UINT32_(&dynamic_allocator);
+                    read_rel_offset(cgfx_file, &texture_header_offset);
+                    read_rel_offset(cgfx_file, &sampler_offset);
+
+                    pica_command_reader cmdr;
+                    pica_cmdr_new(cgfx_file, 13, 1, &cmdr);
+
+                    mtob.texture_mappings[i] = pica_cmdr_get_tex_unit_mapper(&cmdr, i);
+                    mtob.texture_mappings[i].border_colour = pica_cmdr_get_tex_unit_border_colour(&cmdr, i);
+
+                    pica_cmdr_destroy(&cmdr);
+
+                    fseek(cgfx_file, texture_header_offset + 0x18, SEEK_SET);
+                    read_rel_offset(cgfx_file, mtob.offset_alt_names + i);
+
+                    fseek(cgfx_file, sampler_offset + 0x10, SEEK_SET);
+                    assert(fread(&mtob.texture_mappings[i].lod_bias, 4, 1, cgfx_file) == 1);
+                }
+
+                fseek(cgfx_file, position, SEEK_SET);
+            }
+
+            // Shader meta info
+            uint32_t shader_offset;
+            uint32_t frag_shader_offset;
+            uint32_t shader_prog_descript_index;
+            uint32_t num_shader_params;
+            uint32_t shader_param_ptable_offset;
+            uint32_t material_id;
+
+            read_rel_offset(cgfx_file, &shader_offset);
+            read_rel_offset(cgfx_file, &frag_shader_offset);
+            READ_UINT32_(&shader_prog_descript_index);
+            READ_UINT32_(&num_shader_params);
+            read_rel_offset(cgfx_file, &shader_param_ptable_offset);
+            READ_UINT32_(&mtob.light_set_index);
+            READ_UINT32_(&mtob.fog_index);
+
+            // NOTE: Skip the hashes, we don't need them
+            fseek(cgfx_file, 0x30, SEEK_CUR);
+
+            READ_UINT32_(&material_id);
+
+            // Shader
+            if (shader_offset)
+            {
+                READ_UINT32_(&flags);
+                magic_eq(cgfx_file, "SHDR", 0);
+                fseek(cgfx_file, 4, SEEK_CUR);
+                read_rel_offset(cgfx_file, &mtob.shader_ref.id_offset);
+                read_dict_indirect(cgfx_file, &mtob.user_data);
+                read_rel_offset(cgfx_file, &mtob.shader_ref.name_offset);
+                fseek(cgfx_file, 4, SEEK_CUR);
+            }
+
+            // Fragment shader
+            if (frag_shader_offset)
+            {
+                fseek(cgfx_file, frag_shader_offset, SEEK_SET);
+                read_float_rgba(cgfx_file, &mtob.fragment_shader.buffer_colour);
+
+                READ_UINT32_(&flags);
+                mtob.fragment_shader.is_clamp_highlight = flags & 1;
+                mtob.fragment_shader.is_dist0_enabled = (flags & 2) > 0;
+                mtob.fragment_shader.is_dist1_enabled = (flags & 4) > 0;
+                mtob.fragment_shader.is_geomfac0_enabled = (flags & 8) > 0;
+                mtob.fragment_shader.is_geomfac1_enabled = (flags & 16) > 0;
+                mtob.fragment_shader.is_reflect_enabled = (flags & 32) > 0;
+
+                READ_UINT32_(&mtob.fragment_shader.layer_config);
+                READ_UINT32_(&mtob.fragment_shader.fresnel_config);
+                READ_UINT32_(&mtob.fragment_shader.bump_texture);
+                READ_UINT32_(&mtob.fragment_shader.bump_mode);
+
+                READ_UINT32_(&flags);
+                mtob.fragment_shader.bump_renormalise = flags & 1;
+
+                uint32_t frag_light_table_offset;
+                read_rel_offset(cgfx_file, &frag_light_table_offset);
+
+                {
+                    uint32_t previous_pos = ftell(cgfx_file);
+                    fseek(cgfx_file, frag_light_table_offset, SEEK_SET);
+
+                    read_frag_sampler_indirect(cgfx_file, &mtob.fragment_shader.reflect_red);
+                    read_frag_sampler_indirect(cgfx_file, &mtob.fragment_shader.reflect_green);
+                    read_frag_sampler_indirect(cgfx_file, &mtob.fragment_shader.reflect_blue);
+                    read_frag_sampler_indirect(cgfx_file, &mtob.fragment_shader.dist0);
+                    read_frag_sampler_indirect(cgfx_file, &mtob.fragment_shader.dist1);
+                    read_frag_sampler_indirect(cgfx_file, &mtob.fragment_shader.fresnel);
+
+                    fseek(cgfx_file, previous_pos, SEEK_SET);
+                }
+
+                for (uint32_t stage = PICA_TEV_STAGE0; stage <= PICA_TEV_STAGE5; ++stage)
+                {
+                    pica_command_reader reader;
+                    fseek(cgfx_file, 4, SEEK_CUR);
+
+                    pica_cmdr_new(cgfx_file, 6, 1, &reader);
+
+                    mtob.fragment_shader.combiners[stage] = pica_cmdr_get_tev_stage(&reader, stage);
+
+                    pica_cmdr_destroy(&reader);
+                }
+
+                // Read alpha test
+                {
+                    pica_command_reader reader;
+                    pica_cmdr_new(cgfx_file, 2, 1, &reader);
+
+                    mtob.fragment_shader.alpha_test = pica_cmdr_get_alpha_test(&reader);
+
+                    pica_cmdr_destroy(&reader);
+                }
+            }
+        }
+    }
+
+    fclose(cgfx_file);
+#ifdef _WIN32
+    if (cgfx_tmp_file[0])
+        DeleteFileA(cgfx_tmp_file);
+#endif
+    if (output_dir)
+    {
+        free(output_dir);
+    }
+    if (file_buffer)
+    {
+        free(file_buffer);
+    }
+
+    printf("OK\n");
+
+    return 0;
 #undef READ_UINT32_
 }
 
-int main(int argc, char **argv) {
-  const char *cgfx_path = NULL;
-  kgflags_string("i", NULL, "The input file that should be processed", false,
-                 &cgfx_path);
+int main(int argc, char** argv)
+{
+    const char* cgfx_path = NULL;
+    kgflags_string("i", NULL, "The input file that should be processed", false, &cgfx_path);
 
-  const char *dir_path = NULL;
-  kgflags_string("d", NULL, "Directory path containing CGFX files to process", false,
-                 &dir_path);
+    const char* dir_path = NULL;
+    kgflags_string("d", NULL, "Directory path containing CGFX files to process", false, &dir_path);
 
-  char *output_dir;
-  kgflags_string("o", NULL,
-                 "Directory path which exported files should be stored in",
-                 false, (const char **)&output_dir);
+    char* output_dir;
+    kgflags_string("o", NULL, "Directory path which exported files should be stored in", false,
+                   (const char**)&output_dir);
 
-  bool verbose;
-  kgflags_bool("v", false, "Write more detailed output to console", false,
-               &verbose);
+    bool verbose;
+    kgflags_bool("v", false, "Write more detailed output to console", false, &verbose);
 
-  bool recursive;
-  kgflags_bool("r", false, "Process directories recursively (use with -d)", false,
-               &recursive);
+    bool recursive;
+    kgflags_bool("r", false, "Process directories recursively (use with -d)", false, &recursive);
 
-  bool list_contents;
-  kgflags_bool("l", false, "Only list file contents then stop", false,
-               &list_contents);
+    bool list_contents;
+    kgflags_bool("l", false, "Only list file contents then stop", false, &list_contents);
 
-#ifdef WIN32
-  kgflags_set_prefix("/");
+    bool save_decompressed;
+    kgflags_bool("x", false, "Save LZ11-decompressed data to <input>.decompressed", false, &save_decompressed);
+
+#ifdef _WIN32
+    kgflags_set_prefix("/");
 #else
-  kgflags_set_prefix("-");
+    kgflags_set_prefix("-");
 #endif
 
-  kgflags_set_custom_description("* * * * cgfx2gltf by kathrindc * * * *");
+    kgflags_set_custom_description("* * * * cgfx2gltf by kathrindc * * * *");
 
-  if (!kgflags_parse(argc, argv)) {
-    kgflags_print_errors();
-    printf("\n");
-    kgflags_print_usage();
-    exit(1);
-  }
-
-  // Validate that either -i or -d is provided, but not both
-  if (cgfx_path == NULL && dir_path == NULL) {
-    fprintf(stderr, "Error: Either -i (input file) or -d (directory) must be specified\n\n");
-    kgflags_print_usage();
-    exit(1);
-  }
-
-  if (cgfx_path != NULL && dir_path != NULL) {
-    fprintf(stderr, "Error: Cannot specify both -i and -d options\n\n");
-    kgflags_print_usage();
-    exit(1);
-  }
-
-  stbi_write_tga_with_rle = 0;
-
-  // Handle directory batch processing mode
-  if (dir_path != NULL) {
-    printf("Scanning directory: %s %s\n", dir_path, recursive ? "(recursive)" : "");
-    
-    // Collect all file paths
-    file_list_t file_list;
-    file_list.paths = malloc(100 * sizeof(char *)); // Initial capacity
-    file_list.capacity = 100;
-    file_list.count = 0;
-    
-    if (!file_list.paths) {
-      fprintf(stderr, "Error: Memory allocation failed\n");
-      exit(1);
+    if (!kgflags_parse(argc, argv))
+    {
+        kgflags_print_errors();
+        printf("\n");
+        kgflags_print_usage();
+        exit(1);
     }
-    
-    int num_files = scan_directory(dir_path, recursive, collect_file_callback, &file_list);
-    
-    if (num_files < 0) {
-      fprintf(stderr, "Error: Unable to read directory '%s'\n", dir_path);
-      free(file_list.paths);
-      exit(1);
-    } else if (num_files == 0) {
-      printf("No CGFX files found in directory\n");
-      free(file_list.paths);
-      exit(0);
-    }
-    
-    printf("Found %d CGFX file(s)\n\n", num_files);
-    
-    // Process each file
-    int errors = 0;
-    for (int i = 0; i < file_list.count; ++i) {
-      // In batch mode, each file creates its own output directory unless -o is specified
-      int result = process_single_cgfx_file(file_list.paths[i], output_dir, verbose, list_contents);
-      if (result != 0) {
-        errors++;
-        fprintf(stderr, "Failed to process: %s\n", file_list.paths[i]);
-      }
-      free(file_list.paths[i]);
-    }
-    
-    free(file_list.paths);
-    
-    printf("\n");
-    printf("Batch processing complete: %d/%d files processed successfully\n", 
-           num_files - errors, num_files);
-    
-    return errors > 0 ? 1 : 0;
-  }
 
-  // Single file processing mode
-  return process_single_cgfx_file(cgfx_path, output_dir, verbose, list_contents);
+    // Validate that either -i or -d is provided, but not both
+    if (cgfx_path == NULL && dir_path == NULL)
+    {
+        fprintf(stderr, "Error: Either -i (input file) or -d (directory) must be specified\n\n");
+        kgflags_print_usage();
+        exit(1);
+    }
+
+    if (cgfx_path != NULL && dir_path != NULL)
+    {
+        fprintf(stderr, "Error: Cannot specify both -i and -d options\n\n");
+        kgflags_print_usage();
+        exit(1);
+    }
+
+    stbi_write_tga_with_rle = 0;
+
+    // Handle directory batch processing mode
+    if (dir_path != NULL)
+    {
+        printf("Scanning directory: %s %s\n", dir_path, recursive ? "(recursive)" : "");
+
+        // Collect all file paths
+        file_list_t file_list;
+        file_list.paths = malloc(100 * sizeof(char*)); // Initial capacity
+        file_list.capacity = 100;
+        file_list.count = 0;
+
+        if (!file_list.paths)
+        {
+            fprintf(stderr, "Error: Memory allocation failed\n");
+            exit(1);
+        }
+
+        int num_files = scan_directory(dir_path, recursive, collect_file_callback, &file_list);
+
+        if (num_files < 0)
+        {
+            fprintf(stderr, "Error: Unable to read directory '%s'\n", dir_path);
+            free(file_list.paths);
+            exit(1);
+        }
+        else if (num_files == 0)
+        {
+            printf("No CGFX files found in directory\n");
+            free(file_list.paths);
+            exit(0);
+        }
+
+        printf("Found %d CGFX file(s)\n\n", num_files);
+
+        // Process each file
+        int errors = 0;
+        for (int i = 0; i < file_list.count; ++i)
+        {
+            // In batch mode, each file creates its own output directory unless -o is specified
+            int result = process_single_cgfx_file(file_list.paths[i], output_dir, verbose, list_contents,
+                                                  save_decompressed);
+            if (result != 0)
+            {
+                errors++;
+                fprintf(stderr, "Failed to process: %s\n", file_list.paths[i]);
+            }
+            free(file_list.paths[i]);
+        }
+
+        free(file_list.paths);
+
+        printf("\n");
+        printf("Batch processing complete: %d/%d files processed successfully\n", num_files - errors, num_files);
+
+        return errors > 0 ? 1 : 0;
+    }
+
+    // Single file processing mode
+    return process_single_cgfx_file(cgfx_path, output_dir, verbose, list_contents, save_decompressed);
 }
