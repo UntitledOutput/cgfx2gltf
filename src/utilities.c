@@ -79,9 +79,11 @@ int scan_directory(const char *dir_path, int recursive, file_callback_t callback
     if (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
       if (recursive) {
         int sub_count = scan_directory(full_path, recursive, callback, userdata);
-        if (sub_count > 0) {
-          count += sub_count;
+        if (sub_count < 0) {
+          FindClose(hFind);
+          return -1;
         }
+        count += sub_count;
       }
     } else {
       if (has_cgfx_extension(find_data.cFileName)) {
@@ -116,9 +118,11 @@ int scan_directory(const char *dir_path, int recursive, file_callback_t callback
       if (S_ISDIR(statbuf.st_mode)) {
         if (recursive) {
           int sub_count = scan_directory(full_path, recursive, callback, userdata);
-          if (sub_count > 0) {
-            count += sub_count;
+          if (sub_count < 0) {
+            closedir(dir);
+            return -1;
           }
+          count += sub_count;
         }
       } else if (S_ISREG(statbuf.st_mode)) {
         if (has_cgfx_extension(entry->d_name)) {

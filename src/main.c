@@ -103,7 +103,7 @@ int process_single_cgfx_file(const char *cgfx_path, const char *output_dir_overr
       }
       
       if (verbose) {
-        printf("Decompressed %ld bytes -> %zu bytes\n", file_size, buffer_size);
+        printf("Decompressed %zu bytes -> %zu bytes\n", (size_t)file_size, buffer_size);
       }
       
       // Create a memory-based FILE* for reading decompressed data
@@ -784,7 +784,7 @@ int main(int argc, char **argv) {
     int errors = 0;
     for (int i = 0; i < file_list.count; ++i) {
       // In batch mode, each file creates its own output directory unless -o is specified
-      int result = process_single_cgfx_file(file_list.paths[i], NULL, verbose, list_contents);
+      int result = process_single_cgfx_file(file_list.paths[i], output_dir, verbose, list_contents);
       if (result != 0) {
         errors++;
         fprintf(stderr, "Failed to process: %s\n", file_list.paths[i]);
