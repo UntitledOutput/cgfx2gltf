@@ -8,6 +8,7 @@ add_executable(
   src/main.c
   src/cgfx.c
   src/utilities.c
+  src/lz11.c
   src/cgfx/data.c
   src/cgfx/dict.c
   src/cgfx/pica/etc1.c

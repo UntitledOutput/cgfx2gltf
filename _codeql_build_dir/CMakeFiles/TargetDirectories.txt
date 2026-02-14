@@ -1,0 +1,3 @@
+/home/runner/work/cgfx2gltf/cgfx2gltf/_codeql_build_dir/CMakeFiles/cgfx2gltf.dir
+/home/runner/work/cgfx2gltf/cgfx2gltf/_codeql_build_dir/CMakeFiles/edit_cache.dir
+/home/runner/work/cgfx2gltf/cgfx2gltf/_codeql_build_dir/CMakeFiles/rebuild_cache.dir
